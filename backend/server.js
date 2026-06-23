@@ -20,7 +20,9 @@ const ADMIN_PASS  = process.env.ADMIN_PASS   || 'Admin@CM2025';
 // ── Middleware ──────────────────────────────────────────────────
 app.use(cors({ origin: '*' }));
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+app.get("/", (req, res) => {
+  res.send("Creative Minds backend is running 🚀");
+});
 
 // ── JSON File Database ──────────────────────────────────────────
 const DB_FILE = path.join(__dirname, 'database.json');
