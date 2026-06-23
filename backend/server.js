@@ -20,7 +20,7 @@ const ADMIN_PASS  = process.env.ADMIN_PASS   || 'Admin@CM2025';
 // ── Middleware ──────────────────────────────────────────────────
 app.use(cors({ origin: '*' }));
 app.use(express.json());
-app.use(express.static(path.join(__dirname, '../frontend')));
+app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Database setup ──────────────────────────────────────────────
 const db = new Database('./creativeminds.db');
