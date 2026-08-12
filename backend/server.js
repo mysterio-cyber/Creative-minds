@@ -11,6 +11,7 @@ const path         = require('path');
 const fs           = require('fs');
 const helmet       = require('helmet');
 const rateLimit    = require('express-rate-limit');
+const nodemailer   = require('nodemailer');
 const { v4: uuidv4 } = require('uuid');
 
 const app  = express();
@@ -35,6 +36,52 @@ const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH; // bcrypt hash, not plainte
 const FRONTEND_URL    = process.env.FRONTEND_URL || 'https://creative-minds-frontend.onrender.com';
 const NODE_ENV        = process.env.NODE_ENV || 'development';
 
+// ── Email (optional) ────────────────────────────────────────────
+// Not in REQUIRED_ENV on purpose — the site should keep working even if
+// nobody has wired up SMTP yet. We just log instead of sending.
+const EMAIL_HOST         = process.env.EMAIL_HOST;
+const EMAIL_PORT         = process.env.EMAIL_PORT || 587;
+const EMAIL_USER         = process.env.EMAIL_USER;
+const EMAIL_PASS         = process.env.EMAIL_PASS;
+const EMAIL_FROM         = process.env.EMAIL_FROM || EMAIL_USER;
+const ADMIN_NOTIFY_EMAIL = process.env.ADMIN_NOTIFY_EMAIL || ADMIN_EMAIL;
+
+let mailer = null;
+if (EMAIL_HOST && EMAIL_USER && EMAIL_PASS) {
+  mailer = nodemailer.createTransport({
+    host: EMAIL_HOST,
+    port: Number(EMAIL_PORT),
+    secure: Number(EMAIL_PORT) === 465,
+    auth: { user: EMAIL_USER, pass: EMAIL_PASS }
+  });
+  console.log('✅ Email notifications enabled');
+} else {
+  console.warn('⚠️  EMAIL_HOST / EMAIL_USER / EMAIL_PASS not set — "Start a Project" emails will be logged to console instead of sent.');
+}
+
+async function sendMail({ to, subject, html }) {
+  if (!mailer) {
+    console.log(`[DEV] Email skipped (no mailer configured) → to=${to}, subject="${subject}"`);
+    return { skipped: true };
+  }
+  try {
+    await mailer.sendMail({ from: EMAIL_FROM, to, subject, html });
+    return { sent: true };
+  } catch (e) {
+    console.error('Email send failed:', e.message);
+    return { sent: false, error: e.message };
+  }
+}
+
+function escapeHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 // ── Middleware ──────────────────────────────────────────────────
 app.use(helmet());
 app.use(cors({ origin: FRONTEND_URL }));
@@ -55,6 +102,12 @@ const adminLoginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { error: 'Too many login attempts. Please try again later.' }
+});
+
+const startProjectLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: 'Too many requests. Please try again later.' }
 });
 
 // ── JSON File Database ──────────────────────────────────────────
@@ -81,11 +134,24 @@ function writeDB(data) {
   fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
 }
 
+// ── Live activity feed (Server-Sent Events) ─────────────────────
+// The admin dashboard opens an EventSource connection and gets pushed
+// every activity entry the instant it happens — no polling, no email spam.
+let sseClients = [];
+
+function broadcastActivity(entry) {
+  const payload = `data: ${JSON.stringify(entry)}\n\n`;
+  sseClients.forEach(client => {
+    try { client.res.write(payload); } catch { /* client likely gone, cleaned up on close */ }
+  });
+}
+
 // ── Activity logging ────────────────────────────────────────────
 // Structured log: who did it, what happened, and where from.
+// Every entry is persisted AND broadcast live to any open admin dashboard.
 function logActivity(type, detail, req, actor) {
   const db = readDB();
-  db.activity.push({
+  const entry = {
     id        : uuidv4(),
     type,                                  // e.g. 'USER_LOGIN', 'ADMIN_LOGIN', 'CONTACT_DELETED'
     detail,                                // human-readable summary
@@ -93,8 +159,11 @@ function logActivity(type, detail, req, actor) {
     ip        : req?.ip || '',
     userAgent : req?.headers?.['user-agent'] || '',
     created_at: new Date().toISOString()
-  });
+  };
+  db.activity.push(entry);
   writeDB(db);
+  broadcastActivity(entry);
+  return entry;
 }
 
 // ── Auth Middleware ─────────────────────────────────────────────
@@ -225,6 +294,64 @@ app.post('/api/contact', (req, res) => {
   res.json({ success: true, message: 'Message received! We will get back to you within 24 hours.' });
 });
 
+// Start a Project — high-value CTA, gets an immediate email (not just a dashboard ping)
+app.post('/api/start-project', startProjectLimiter, async (req, res) => {
+  const { name, email, phone, company, projectType, budget, message } = req.body;
+  if (!name || !email) return res.status(400).json({ error: 'Name and email are required' });
+
+  const db = readDB();
+  db.contacts.push({
+    id: uuidv4(), name, email, phone: phone || '', company: company || '',
+    service: projectType || 'Start a Project', message: message || '',
+    budget: budget || '', status: 'new', created_at: new Date().toISOString()
+  });
+  writeDB(db);
+
+  // This still shows up in the live dashboard feed like everything else...
+  logActivity('PROJECT_START', `New project enquiry from ${name} (${email}) — ${projectType || 'Unspecified'}`, req);
+
+  // ...but ALSO fires an immediate email, because this action is worth an inbox alert.
+  const [userEmailResult, adminEmailResult] = await Promise.all([
+    sendMail({
+      to: email,
+      subject: 'We received your project request — Creative Minds',
+      html: `
+        <p>Hi ${escapeHtml(name)},</p>
+        <p>Thanks for reaching out to start a project with us! We've received your details and someone from our team will be in touch within 24 hours.</p>
+        <p><strong>What you told us:</strong></p>
+        <ul>
+          ${projectType ? `<li>Project type: ${escapeHtml(projectType)}</li>` : ''}
+          ${budget ? `<li>Budget: ${escapeHtml(budget)}</li>` : ''}
+          ${message ? `<li>Message: ${escapeHtml(message)}</li>` : ''}
+        </ul>
+        <p>— The Creative Minds Team</p>
+      `
+    }),
+    sendMail({
+      to: ADMIN_NOTIFY_EMAIL,
+      subject: `🚀 New project request from ${name}`,
+      html: `
+        <p>New "Start a Project" submission:</p>
+        <ul>
+          <li>Name: ${escapeHtml(name)}</li>
+          <li>Email: ${escapeHtml(email)}</li>
+          <li>Phone: ${escapeHtml(phone || '—')}</li>
+          <li>Company: ${escapeHtml(company || '—')}</li>
+          <li>Project type: ${escapeHtml(projectType || '—')}</li>
+          <li>Budget: ${escapeHtml(budget || '—')}</li>
+          <li>Message: ${escapeHtml(message || '—')}</li>
+        </ul>
+      `
+    })
+  ]);
+
+  res.json({
+    success: true,
+    message: 'Thanks! We received your project request and will be in touch soon.',
+    emailStatus: { user: userEmailResult, admin: adminEmailResult }
+  });
+});
+
 // Get approved reviews
 app.get('/api/reviews', (req, res) => {
   const db = readDB();
@@ -277,6 +404,44 @@ app.post('/api/admin/login', adminLoginLimiter, async (req, res) => {
   const token = jwt.sign({ admin: true, email }, JWT_SECRET, { expiresIn: '24h' });
   logActivity('ADMIN_LOGIN', 'Admin logged in', req, { email, role: 'admin' });
   res.json({ success: true, token });
+});
+
+// Live activity stream — the admin dashboard's real-time notification feed.
+// EventSource can't send an Authorization header, so the admin JWT is passed
+// as a query param instead and verified by hand (same JWT_SECRET, same checks
+// as adminOnly, just adapted for SSE's transport limits).
+app.get('/api/admin/activity-stream', (req, res) => {
+  const token = req.query.token;
+  if (!token) return res.status(401).end();
+
+  let payload;
+  try {
+    payload = jwt.verify(token, JWT_SECRET);
+  } catch {
+    return res.status(401).end();
+  }
+  if (!payload.admin) return res.status(403).end();
+
+  res.writeHead(200, {
+    'Content-Type'   : 'text/event-stream',
+    'Cache-Control'  : 'no-cache',
+    'Connection'     : 'keep-alive',
+    'X-Accel-Buffering': 'no' // disable proxy buffering (nginx/Render)
+  });
+  res.write(': connected\n\n');
+
+  const client = { id: uuidv4(), res };
+  sseClients.push(client);
+
+  // Keep the connection alive through idle-timeout proxies
+  const heartbeat = setInterval(() => {
+    try { res.write(': heartbeat\n\n'); } catch { /* handled by close event below */ }
+  }, 25000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    sseClients = sseClients.filter(c => c.id !== client.id);
+  });
 });
 
 app.get('/api/admin/dashboard', adminOnly, (req, res) => {
