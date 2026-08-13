@@ -9,7 +9,7 @@ const helmet         = require('helmet');
 const rateLimit      = require('express-rate-limit');
 
 const pool = require('./Db');
-const { sendMail, escapeHtml, isConfigured: emailConfigured } = require('./mailer');
+const { sendMail, escapeHtml, isConfigured: emailConfigured } = require('./Mailer');
 const { createAndSendOtp, verifyOtp, purgeExpiredOtps } = require('./otpService');
 
 const app  = express();
