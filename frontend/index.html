@@ -687,13 +687,15 @@ footer{background:var(--ink);color:white;padding:64px 5% 28px;}
 
     <div class="step" id="step2">
       <div class="modal-title">Enter OTP</div>
-      <div class="modal-sub" id="otpSub">We sent a 4-digit OTP to your contact.</div>
-      <div class="otp-boxes">
-        <input class="otp-box" type="text" inputmode="numeric" maxlength="1" id="otp1" oninput="otpMove(this,'otp2')" onkeydown="otpBack(event,this,null)"/>
-        <input class="otp-box" type="text" inputmode="numeric" maxlength="1" id="otp2" oninput="otpMove(this,'otp3')" onkeydown="otpBack(event,this,'otp1')"/>
-        <input class="otp-box" type="text" inputmode="numeric" maxlength="1" id="otp3" oninput="otpMove(this,'otp4')" onkeydown="otpBack(event,this,'otp2')"/>
-        <input class="otp-box" type="text" inputmode="numeric" maxlength="1" id="otp4" oninput="otpMove(this,null)" onkeydown="otpBack(event,this,'otp3')"/>
-      </div>
+      <div class="modal-sub" id="otpSub">We sent a 6-digit OTP to your contact.</div>
+<div class="otp-boxes">
+  <input class="otp-box" type="text" inputmode="numeric" maxlength="1" id="otp1" oninput="otpMove(this,'otp2')" onkeydown="otpBack(event,this,null)"/>
+  <input class="otp-box" type="text" inputmode="numeric" maxlength="1" id="otp2" oninput="otpMove(this,'otp3')" onkeydown="otpBack(event,this,'otp1')"/>
+  <input class="otp-box" type="text" inputmode="numeric" maxlength="1" id="otp3" oninput="otpMove(this,'otp4')" onkeydown="otpBack(event,this,'otp2')"/>
+  <input class="otp-box" type="text" inputmode="numeric" maxlength="1" id="otp4" oninput="otpMove(this,'otp5')" onkeydown="otpBack(event,this,'otp3')"/>
+  <input class="otp-box" type="text" inputmode="numeric" maxlength="1" id="otp5" oninput="otpMove(this,'otp6')" onkeydown="otpBack(event,this,'otp4')"/>
+  <input class="otp-box" type="text" inputmode="numeric" maxlength="1" id="otp6" oninput="otpMove(this,null)" onkeydown="otpBack(event,this,'otp5')"/>
+</div>
       <div class="otp-hint">Didn&rsquo;t receive it? <a onclick="resendOTP()">Resend OTP</a></div>
       <button type="button" class="auth-btn" id="verifyBtn" onclick="verifyOTP()">Verify &amp; Continue &rarr;</button>
       <div style="text-align:center;margin-top:14px;"><a onclick="goStep(1)" style="font-size:13px;color:var(--muted);cursor:pointer;">&larr; Go back</a></div>
@@ -845,7 +847,7 @@ footer{background:var(--ink);color:white;padding:64px 5% 28px;}
 
 <script>
 // ── CONFIG ──────────────────────────────────────────────────────
-var API = 'https://creative-minds-backend.onrender.com/api'; // Change to your deployed backend URL
+var API = 'http://localhost:4000/api'; // Change to your deployed backend URL
 
 // ── STATE ───────────────────────────────────────────────────────
 var authMode = 'login', authTab = 'phone';
@@ -976,7 +978,7 @@ async function sendOTP() {
   try {
     var res = await api('POST', '/send-otp', { contact: contact });
     var dest = authTab==='phone' ? '+91 '+contact : contact;
-    setText('otpSub', 'OTP sent to '+dest+'. (Demo OTP: '+res.demo_otp+')');
+    setText('otpSub', 'OTP sent to '+dest+'.');
     clearOtpBoxes(); goStep(2);
     setTimeout(function(){ document.getElementById('otp1').focus(); }, 100);
   } catch(e) { showAuthError(e.message); }
@@ -988,20 +990,20 @@ async function resendOTP() {
   try {
     var res = await api('POST', '/send-otp', { contact: currentAuthContact });
     var dest = authTab==='phone' ? '+91 '+currentAuthContact : currentAuthContact;
-    setText('otpSub', 'New OTP sent to '+dest+'. (Demo OTP: '+res.demo_otp+')');
+    setText('otpSub', 'New OTP sent to '+dest+'.');
     clearOtpBoxes();
     showToast('OTP resent successfully!');
     document.getElementById('otp1').focus();
   } catch(e) { showAuthError(e.message); }
 }
 
-function clearOtpBoxes() { ['otp1','otp2','otp3','otp4'].forEach(function(id){var el=document.getElementById(id);if(el)el.value='';}); }
+function clearOtpBoxes() { ['otp1','otp2','otp3','otp4','otp5','otp6'].forEach(function(id){var el=document.getElementById(id);if(el)el.value='';}); }
 function otpMove(el,nextId){ if(el.value.length===1&&nextId) document.getElementById(nextId).focus(); }
 function otpBack(e,el,prevId){ if(e.key==='Backspace'&&el.value===''&&prevId) document.getElementById(prevId).focus(); }
 
 async function verifyOTP() {
-  var entered = ['otp1','otp2','otp3','otp4'].map(function(id){return document.getElementById(id).value;}).join('');
-  if (entered.length<4) { showAuthError('Please enter the complete 4-digit OTP.'); return; }
+  var entered = ['otp1','otp2','otp3','otp4','otp5','otp6'].map(function(id){return document.getElementById(id).value;}).join('');
+  if (entered.length<6) { showAuthError('Please enter the complete 6-digit OTP.'); return; }
   var btn = document.getElementById('verifyBtn');
   btn.disabled=true; btn.innerHTML='<span class="spinner"></span>Verifying...';
   try {

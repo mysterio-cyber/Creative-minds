@@ -1,6 +1,9 @@
 // ─────────────────────────────────────────────────────────────────
 // Creative Minds — Backend Server (Postgres + real OTP delivery)
 // ─────────────────────────────────────────────────────────────────
+
+require('dotenv').config();
+
 const express       = require('express');
 const cors          = require('cors');
 const jwt           = require('jsonwebtoken');
@@ -51,9 +54,15 @@ app.get('/', (req, res) => res.send('Creative Minds backend is running 🚀'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
 // ── Rate limiters (separate budgets for send vs verify) ─────────
-const sendOtpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
+  message: { error: 'Too many OTP requests. Please try again later.' }
+});  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: 'Too many OTP requests. Please try again later.' }
+});const sendOtpLimiter = rateLimit({
+  windowMs:15* 60 * 1000,
+  max: 7,
   message: { error: 'Too many OTP requests. Please try again later.' }
 });
 const verifyOtpLimiter = rateLimit({
@@ -501,8 +510,10 @@ app.get('/api/admin/activity', adminOnly, asyncRoute(async (req, res) => {
 
 // ── Global error handler ───────────────────────────────────────
 app.use((err, req, res, next) => {
-  console.error(err);
-  res.status(500).json({ error: 'Something went wrong.' });
+  console.error('❌ SERVER ERROR:', err);
+  res.status(500).json({
+    error: err.message || 'Something went wrong.'
+  });
 });
 
 // ── Housekeeping: purge old OTPs once a day ─────────────────────
