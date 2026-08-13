@@ -54,27 +54,24 @@ app.get('/', (req, res) => res.send('Creative Minds backend is running 🚀'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
 // ── Rate limiters (separate budgets for send vs verify) ─────────
+const sendOtpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
   message: { error: 'Too many OTP requests. Please try again later.' }
-});  windowMs: 15 * 60 * 1000,
-  max: 5,
-  message: { error: 'Too many OTP requests. Please try again later.' }
-});const sendOtpLimiter = rateLimit({
-  windowMs:15* 60 * 1000,
-  max: 7,
-  message: { error: 'Too many OTP requests. Please try again later.' }
 });
+
 const verifyOtpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 15,
   message: { error: 'Too many verification attempts. Please try again later.' }
 });
+
 const adminLoginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { error: 'Too many login attempts. Please try again later.' }
 });
+
 const startProjectLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
