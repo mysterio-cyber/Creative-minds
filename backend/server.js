@@ -10,7 +10,7 @@ const rateLimit      = require('express-rate-limit');
 
 const pool = require('./Db');
 const { sendMail, escapeHtml, isConfigured: emailConfigured } = require('./Mailer');
-const { createAndSendOtp, verifyOtp, purgeExpiredOtps } = require('./otpService');
+const { createAndSendOtp, verifyOtp, purgeExpiredOtps } = require('./Otpservice');
 
 const app  = express();
 const PORT = process.env.PORT || 4000;
