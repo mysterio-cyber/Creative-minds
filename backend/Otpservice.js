@@ -6,7 +6,7 @@
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const twilio = require('twilio');
-const pool = require('./db');
+const pool = require('./Db');
 const { sendMail } = require('./mailer');
 
 const TWILIO_REQUIRED = ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_PHONE_NUMBER'];
