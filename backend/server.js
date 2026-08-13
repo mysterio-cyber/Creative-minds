@@ -1,172 +1,105 @@
 // ─────────────────────────────────────────────────────────────────
-// Creative Minds — Backend Server (hardened)
-// Stack : Node.js + Express + JSON file database (no native modules)
-// Deploy: Works on Render, Railway, Vercel, any Node host
+// Creative Minds — Backend Server (Postgres + real OTP delivery)
 // ─────────────────────────────────────────────────────────────────
-const express      = require('express');
-const cors         = require('cors');
-const jwt          = require('jsonwebtoken');
-const bcrypt       = require('bcryptjs');
-const path         = require('path');
-const fs           = require('fs');
-const helmet       = require('helmet');
-const rateLimit    = require('express-rate-limit');
-const nodemailer   = require('nodemailer');
-const { v4: uuidv4 } = require('uuid');
+const express       = require('express');
+const cors          = require('cors');
+const jwt           = require('jsonwebtoken');
+const bcrypt         = require('bcryptjs');
+const helmet         = require('helmet');
+const rateLimit      = require('express-rate-limit');
+
+const pool = require('./db');
+const { sendMail, escapeHtml, isConfigured: emailConfigured } = require('./mailer');
+const { createAndSendOtp, verifyOtp, purgeExpiredOtps } = require('./otpService');
 
 const app  = express();
 const PORT = process.env.PORT || 4000;
 
-// ── Required secrets — fail fast instead of falling back to known values ──
-// (Your old fallbacks were hardcoded in source and already leaked publicly
-// in render.yaml, so they must never be used as a safety net again.)
-const REQUIRED_ENV = ['JWT_SECRET', 'ADMIN_EMAIL', 'ADMIN_PASS_HASH'];
+// ── Required secrets — fail fast instead of silently misbehaving ──
+const REQUIRED_ENV = ['JWT_SECRET', 'ADMIN_EMAIL', 'ADMIN_PASS_HASH', 'DATABASE_URL'];
 const missing = REQUIRED_ENV.filter(k => !process.env[k]);
 if (missing.length) {
   console.error(`❌ Missing required env vars: ${missing.join(', ')}`);
-  console.error('   Set these in your Render dashboard (not in render.yaml).');
-  console.error('   ADMIN_PASS_HASH must be a bcrypt hash — generate one with:');
-  console.error('   node -e "console.log(require(\'bcryptjs\').hashSync(\'yourNewPassword\', 10))"');
+  console.error('   ADMIN_PASS_HASH must be a bcrypt hash, e.g.:');
+  console.error('   node -e "console.log(require(\'bcryptjs\').hashSync(\'yourPassword\', 10))"');
   process.exit(1);
 }
 
 const JWT_SECRET      = process.env.JWT_SECRET;
 const ADMIN_EMAIL     = process.env.ADMIN_EMAIL;
-const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH; // bcrypt hash, not plaintext
+const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH;
 const FRONTEND_URL    = process.env.FRONTEND_URL || 'https://creative-minds-frontend.onrender.com';
 const NODE_ENV        = process.env.NODE_ENV || 'development';
-
-// ── Email (optional) ────────────────────────────────────────────
-// Not in REQUIRED_ENV on purpose — the site should keep working even if
-// nobody has wired up SMTP yet. We just log instead of sending.
-const EMAIL_HOST         = process.env.EMAIL_HOST;
-const EMAIL_PORT         = process.env.EMAIL_PORT || 587;
-const EMAIL_USER         = process.env.EMAIL_USER;
-const EMAIL_PASS         = process.env.EMAIL_PASS;
-const EMAIL_FROM         = process.env.EMAIL_FROM || EMAIL_USER;
 const ADMIN_NOTIFY_EMAIL = process.env.ADMIN_NOTIFY_EMAIL || ADMIN_EMAIL;
 
-let mailer = null;
-if (EMAIL_HOST && EMAIL_USER && EMAIL_PASS) {
-  mailer = nodemailer.createTransport({
-    host: EMAIL_HOST,
-    port: Number(EMAIL_PORT),
-    secure: Number(EMAIL_PORT) === 465,
-    auth: { user: EMAIL_USER, pass: EMAIL_PASS }
-  });
-  console.log('✅ Email notifications enabled');
-} else {
-  console.warn('⚠️  EMAIL_HOST / EMAIL_USER / EMAIL_PASS not set — "Start a Project" emails will be logged to console instead of sent.');
-}
-
-async function sendMail({ to, subject, html }) {
-  if (!mailer) {
-    console.log(`[DEV] Email skipped (no mailer configured) → to=${to}, subject="${subject}"`);
-    return { skipped: true };
-  }
-  try {
-    await mailer.sendMail({ from: EMAIL_FROM, to, subject, html });
-    return { sent: true };
-  } catch (e) {
-    console.error('Email send failed:', e.message);
-    return { sent: false, error: e.message };
-  }
-}
-
-function escapeHtml(str) {
-  return String(str ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+if (!emailConfigured) {
+  console.warn('⚠️  Email is not configured — OTP emails and notification emails will fail until EMAIL_HOST/EMAIL_USER/EMAIL_PASS are set.');
 }
 
 // ── Middleware ──────────────────────────────────────────────────
+// Required on Render (and most PaaS) so req.ip reflects the real client
+// IP instead of the platform's internal proxy IP. Without this, rate
+// limiting and IP logging are both effectively broken.
+app.set('trust proxy', 1);
+
 app.use(helmet());
 app.use(cors({ origin: FRONTEND_URL }));
-app.use(express.json({ limit: '100kb' })); // cap body size
+app.use(express.json({ limit: '100kb' }));
 
-app.get('/', (req, res) => {
-  res.send('Creative Minds backend is running 🚀');
+app.get('/', (req, res) => res.send('Creative Minds backend is running 🚀'));
+app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+
+// ── Rate limiters (separate budgets for send vs verify) ─────────
+const sendOtpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: { error: 'Too many OTP requests. Please try again later.' }
 });
-
-// ── Rate limiters ───────────────────────────────────────────────
-const otpLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 min
-  max: 5,                   // 5 requests per IP per window
-  message: { error: 'Too many requests. Please try again later.' }
+const verifyOtpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 15,
+  message: { error: 'Too many verification attempts. Please try again later.' }
 });
-
 const adminLoginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { error: 'Too many login attempts. Please try again later.' }
 });
-
 const startProjectLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
   message: { error: 'Too many requests. Please try again later.' }
 });
 
-// ── JSON File Database ──────────────────────────────────────────
-// NOTE: On Render's free tier this file lives on ephemeral disk and
-// WILL be wiped on redeploy/restart. Add a persistent disk in Render,
-// or migrate to a hosted DB (MongoDB Atlas / Render Postgres) before
-// you rely on this data long-term.
-const DB_FILE = path.join(__dirname, 'database.json');
-
-function readDB() {
-  try {
-    if (!fs.existsSync(DB_FILE)) return initDB();
-    return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  } catch (e) {
-    return initDB();
-  }
-}
-
-function initDB() {
-  return { users: [], contacts: [], reviews: [], activity: [], otps: [] };
-}
-
-function writeDB(data) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-}
-
 // ── Live activity feed (Server-Sent Events) ─────────────────────
-// The admin dashboard opens an EventSource connection and gets pushed
-// every activity entry the instant it happens — no polling, no email spam.
 let sseClients = [];
 
 function broadcastActivity(entry) {
   const payload = `data: ${JSON.stringify(entry)}\n\n`;
   sseClients.forEach(client => {
-    try { client.res.write(payload); } catch { /* client likely gone, cleaned up on close */ }
+    try { client.res.write(payload); } catch { /* cleaned up on close */ }
   });
 }
 
-// ── Activity logging ────────────────────────────────────────────
-// Structured log: who did it, what happened, and where from.
-// Every entry is persisted AND broadcast live to any open admin dashboard.
-function logActivity(type, detail, req, actor) {
-  const db = readDB();
-  const entry = {
-    id        : uuidv4(),
-    type,                                  // e.g. 'USER_LOGIN', 'ADMIN_LOGIN', 'CONTACT_DELETED'
-    detail,                                // human-readable summary
-    actor     : actor || null,             // { id, name/email, role } of whoever did it
-    ip        : req?.ip || '',
-    userAgent : req?.headers?.['user-agent'] || '',
-    created_at: new Date().toISOString()
-  };
-  db.activity.push(entry);
-  writeDB(db);
-  broadcastActivity(entry);
-  return entry;
+// ── Activity logging (Postgres-backed, joinable to users) ───────
+async function logActivity(eventType, req, userId, metadata) {
+  const { rows } = await pool.query(
+    `INSERT INTO activity_logs (user_id, event_type, ip_address, user_agent, metadata)
+     VALUES ($1, $2, $3, $4, $5)
+     RETURNING *`,
+    [
+      userId || null,
+      eventType,
+      req?.ip || '',
+      req?.headers?.['user-agent'] || '',
+      metadata ? JSON.stringify(metadata) : null
+    ]
+  );
+  broadcastActivity(rows[0]);
+  return rows[0];
 }
 
-// ── Auth Middleware ─────────────────────────────────────────────
+// ── Auth middleware ──────────────────────────────────────────────
 function authMiddleware(req, res, next) {
   const token = (req.headers.authorization || '').replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'Unauthorized' });
@@ -178,218 +111,209 @@ function authMiddleware(req, res, next) {
   }
 }
 
-// Admin routes must check the token actually belongs to an admin —
-// a regular user's valid JWT should NOT pass this.
 function adminOnly(req, res, next) {
   authMiddleware(req, res, () => {
     if (!req.user || req.user.admin !== true) {
-      logActivity('UNAUTHORIZED_ADMIN_ATTEMPT', `Non-admin token tried to access ${req.originalUrl}`, req, req.user);
+      logActivity('UNAUTHORIZED_ADMIN_ATTEMPT', req, null, { path: req.originalUrl }).catch(() => {});
       return res.status(403).json({ error: 'Forbidden' });
     }
     next();
   });
 }
 
+// small helper to avoid try/catch boilerplate in every route
+function asyncRoute(fn) {
+  return (req, res, next) => fn(req, res, next).catch(next);
+}
+
 // ─────────────────────────────────────────────────────────────────
 // PUBLIC ROUTES
 // ─────────────────────────────────────────────────────────────────
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
-});
-
-// Send OTP
-app.post('/api/send-otp', otpLimiter, (req, res) => {
+// ── OTP: send ─────────────────────────────────────────────────────
+app.post('/api/send-otp', sendOtpLimiter, asyncRoute(async (req, res) => {
   const { contact } = req.body;
   if (!contact) return res.status(400).json({ error: 'Contact required' });
 
-  const otp     = String(Math.floor(100000 + Math.random() * 900000)); // 6 digits, not 4
-  const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  await createAndSendOtp(contact);
+  await logActivity('OTP_REQUESTED', req, null, { contact_type: contact.includes('@') ? 'email' : 'phone' });
 
-  const db = readDB();
-  db.otps = db.otps.filter(o => o.contact !== contact);
-  db.otps.push({ id: uuidv4(), contact, otp, expires, used: false, attempts: 0 });
-  writeDB(db);
-
-  logActivity('OTP_SENT', `OTP requested for ${contact}`, req);
-
-  // TODO: integrate real delivery — Twilio / MSG91 / SendGrid.
-  // The OTP must be sent to the user's phone/email, never returned
-  // in this API response — returning it lets anyone log in as anyone.
-  if (NODE_ENV !== 'production') {
-    console.log(`[DEV ONLY] OTP for ${contact}: ${otp}`);
-    return res.json({ success: true, dev_note: 'OTP logged to server console in dev mode only' });
-  }
-
+  // The OTP itself is NEVER returned here, in dev or prod — it only
+  // ever leaves the server via the actual email/SMS channel.
   res.json({ success: true, message: 'OTP sent.' });
-});
+}));
 
-// Verify OTP + login/register
-app.post('/api/verify-otp', otpLimiter, (req, res) => {
+// ── OTP: verify + login/register ─────────────────────────────────
+app.post('/api/verify-otp', verifyOtpLimiter, asyncRoute(async (req, res) => {
   const { contact, otp, name, company } = req.body;
   if (!contact || !otp) return res.status(400).json({ error: 'Contact and OTP required' });
 
-  const db  = readDB();
-  const row = db.otps.filter(o => o.contact === contact && !o.used).pop();
-
-  if (!row) return res.status(400).json({ error: 'OTP not found. Please request a new one.' });
-  if (new Date(row.expires) < new Date()) return res.status(400).json({ error: 'OTP expired. Please request a new one.' });
-
-  // Cap verification attempts per OTP to slow brute force
-  if (row.attempts >= 5) {
-    return res.status(429).json({ error: 'Too many incorrect attempts. Please request a new OTP.' });
-  }
-  if (row.otp !== otp) {
-    db.otps = db.otps.map(o => o.id === row.id ? { ...o, attempts: o.attempts + 1 } : o);
-    writeDB(db);
-    return res.status(400).json({ error: 'Incorrect OTP. Please try again.' });
+  const result = await verifyOtp(contact, otp);
+  if (!result.ok) {
+    await logActivity('LOGIN_FAILED', req, null, { contact });
+    return res.status(400).json({ error: result.error });
   }
 
-  db.otps = db.otps.map(o => o.id === row.id ? { ...o, used: true } : o);
+  const isEmailContact = contact.includes('@');
+  const { rows: existing } = await pool.query(
+    `SELECT * FROM users WHERE ${isEmailContact ? 'email' : 'phone'} = $1`,
+    [contact]
+  );
 
-  let user = db.users.find(u => u.email === contact || u.phone === contact);
-  let eventType, eventDetail;
+  let user = existing[0];
+  let eventType;
 
   if (!user) {
-    user = {
-      id        : uuidv4(),
-      name      : name || 'User',
-      email     : contact.includes('@') ? contact : null,
-      phone     : contact.includes('@') ? null    : contact,
-      company   : company || null,
-      created_at: new Date().toISOString()
-    };
-    db.users.push(user);
-    eventType = 'USER_REGISTERED';
-    eventDetail = `New user: ${user.name} (${contact})`;
+    const { rows } = await pool.query(
+      `INSERT INTO users (name, email, phone, company) VALUES ($1, $2, $3, $4) RETURNING *`,
+      [name || 'User', isEmailContact ? contact : null, isEmailContact ? null : contact, company || null]
+    );
+    user = rows[0];
+    eventType = 'ACCOUNT_CREATED';
   } else {
     if (name && name !== 'User') {
-      user.name    = name;
-      user.company = company || user.company;
-      db.users = db.users.map(u => u.id === user.id ? user : u);
+      const { rows } = await pool.query(
+        `UPDATE users SET name = $1, company = $2 WHERE id = $3 RETURNING *`,
+        [name, company || user.company, user.id]
+      );
+      user = rows[0];
     }
-    eventType = 'USER_LOGIN';
-    eventDetail = `Login: ${user.name} (${contact})`;
+    eventType = 'LOGIN_SUCCESS';
   }
 
-  writeDB(db);
   const token = jwt.sign({ id: user.id, name: user.name, admin: false }, JWT_SECRET, { expiresIn: '7d' });
-  logActivity(eventType, eventDetail, req, { id: user.id, name: user.name, role: 'user' });
-  res.json({ success: true, token, user: { id: user.id, name: user.name, company: user.company } });
-});
+  await pool.query(
+    `INSERT INTO sessions (user_id, expires_at) VALUES ($1, $2)`,
+    [user.id, new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)]
+  );
+  await logActivity(eventType, req, user.id, { name: user.name });
 
-// Submit contact form
-app.post('/api/contact', (req, res) => {
+  res.json({ success: true, token, user: { id: user.id, name: user.name, company: user.company } });
+}));
+
+// ── Logout (revokes the session row; JWT itself still expires naturally) ──
+app.post('/api/logout', authMiddleware, asyncRoute(async (req, res) => {
+  await pool.query(
+    `UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL`,
+    [req.user.id]
+  );
+  await logActivity('LOGOUT', req, req.user.id, null);
+  res.json({ success: true });
+}));
+
+// ── Contact form ──────────────────────────────────────────────────
+app.post('/api/contact', asyncRoute(async (req, res) => {
   const { name, email, phone, company, service, message } = req.body;
   if (!name || !message) return res.status(400).json({ error: 'Name and message are required' });
 
-  const db = readDB();
-  db.contacts.push({
-    id: uuidv4(), name, email: email || '', phone: phone || '',
-    company: company || '', service: service || '', message,
-    status: 'new', created_at: new Date().toISOString()
-  });
-  writeDB(db);
-  logActivity('CONTACT_FORM', `New enquiry from ${name} — ${service || 'General'}`, req);
-  res.json({ success: true, message: 'Message received! We will get back to you within 24 hours.' });
-});
+  await pool.query(
+    `INSERT INTO contact_submissions (name, email, phone, company, service, message)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [name, email || null, phone || null, company || null, service || null, message]
+  );
+  await logActivity('CONTACT_FORM_SUBMITTED', req, null, { name, service });
 
-// Start a Project — high-value CTA, gets an immediate email (not just a dashboard ping)
-app.post('/api/start-project', startProjectLimiter, async (req, res) => {
+  res.json({ success: true, message: 'Message received! We will get back to you within 24 hours.' });
+}));
+
+// ── Start a Project ────────────────────────────────────────────────
+app.post('/api/start-project', startProjectLimiter, asyncRoute(async (req, res) => {
   const { name, email, phone, company, projectType, budget, message } = req.body;
   if (!name || !email) return res.status(400).json({ error: 'Name and email are required' });
 
-  const db = readDB();
-  db.contacts.push({
-    id: uuidv4(), name, email, phone: phone || '', company: company || '',
-    service: projectType || 'Start a Project', message: message || '',
-    budget: budget || '', status: 'new', created_at: new Date().toISOString()
-  });
-  writeDB(db);
+  await pool.query(
+    `INSERT INTO projects (name, email, phone, company, project_type, budget, message)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [name, email, phone || null, company || null, projectType || null, budget || null, message || null]
+  );
+  await logActivity('PROJECT_STARTED', req, null, { name, email, projectType });
 
-  // This still shows up in the live dashboard feed like everything else...
-  logActivity('PROJECT_START', `New project enquiry from ${name} (${email}) — ${projectType || 'Unspecified'}`, req);
+  let emailStatus = { user: { skipped: true }, admin: { skipped: true } };
+  if (emailConfigured) {
+    const [userResult, adminResult] = await Promise.allSettled([
+      sendMail({
+        to: email,
+        subject: 'We received your project request — Creative Minds',
+        html: `
+          <p>Hi ${escapeHtml(name)},</p>
+          <p>Thanks for reaching out to start a project with us! Someone from our team will be in touch within 24 hours.</p>
+          <ul>
+            ${projectType ? `<li>Project type: ${escapeHtml(projectType)}</li>` : ''}
+            ${budget ? `<li>Budget: ${escapeHtml(budget)}</li>` : ''}
+            ${message ? `<li>Message: ${escapeHtml(message)}</li>` : ''}
+          </ul>
+          <p>— The Creative Minds Team</p>
+        `
+      }),
+      sendMail({
+        to: ADMIN_NOTIFY_EMAIL,
+        subject: `🚀 New project request from ${name}`,
+        html: `
+          <ul>
+            <li>Name: ${escapeHtml(name)}</li>
+            <li>Email: ${escapeHtml(email)}</li>
+            <li>Phone: ${escapeHtml(phone || '—')}</li>
+            <li>Company: ${escapeHtml(company || '—')}</li>
+            <li>Project type: ${escapeHtml(projectType || '—')}</li>
+            <li>Budget: ${escapeHtml(budget || '—')}</li>
+            <li>Message: ${escapeHtml(message || '—')}</li>
+          </ul>
+        `
+      })
+    ]);
+    emailStatus = {
+      user:  userResult.status  === 'fulfilled' ? userResult.value  : { sent: false, error: userResult.reason?.message },
+      admin: adminResult.status === 'fulfilled' ? adminResult.value : { sent: false, error: adminResult.reason?.message }
+    };
+  }
 
-  // ...but ALSO fires an immediate email, because this action is worth an inbox alert.
-  const [userEmailResult, adminEmailResult] = await Promise.all([
-    sendMail({
-      to: email,
-      subject: 'We received your project request — Creative Minds',
-      html: `
-        <p>Hi ${escapeHtml(name)},</p>
-        <p>Thanks for reaching out to start a project with us! We've received your details and someone from our team will be in touch within 24 hours.</p>
-        <p><strong>What you told us:</strong></p>
-        <ul>
-          ${projectType ? `<li>Project type: ${escapeHtml(projectType)}</li>` : ''}
-          ${budget ? `<li>Budget: ${escapeHtml(budget)}</li>` : ''}
-          ${message ? `<li>Message: ${escapeHtml(message)}</li>` : ''}
-        </ul>
-        <p>— The Creative Minds Team</p>
-      `
-    }),
-    sendMail({
-      to: ADMIN_NOTIFY_EMAIL,
-      subject: `🚀 New project request from ${name}`,
-      html: `
-        <p>New "Start a Project" submission:</p>
-        <ul>
-          <li>Name: ${escapeHtml(name)}</li>
-          <li>Email: ${escapeHtml(email)}</li>
-          <li>Phone: ${escapeHtml(phone || '—')}</li>
-          <li>Company: ${escapeHtml(company || '—')}</li>
-          <li>Project type: ${escapeHtml(projectType || '—')}</li>
-          <li>Budget: ${escapeHtml(budget || '—')}</li>
-          <li>Message: ${escapeHtml(message || '—')}</li>
-        </ul>
-      `
-    })
-  ]);
+  res.json({ success: true, message: 'Thanks! We received your project request and will be in touch soon.', emailStatus });
+}));
 
-  res.json({
-    success: true,
-    message: 'Thanks! We received your project request and will be in touch soon.',
-    emailStatus: { user: userEmailResult, admin: adminEmailResult }
-  });
-});
+// ── Reviews (public) ────────────────────────────────────────────
+app.get('/api/reviews', asyncRoute(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT id, name, role, text, rating, created_at FROM reviews WHERE approved = true ORDER BY created_at DESC`
+  );
+  res.json(rows);
+}));
 
-// Get approved reviews
-app.get('/api/reviews', (req, res) => {
-  const db = readDB();
-  const reviews = db.reviews.filter(r => r.approved).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  res.json(reviews);
-});
-
-// Submit review
-app.post('/api/reviews', (req, res) => {
+app.post('/api/reviews', asyncRoute(async (req, res) => {
   const { name, role, text, rating } = req.body;
   if (!name || !text || !rating) return res.status(400).json({ error: 'Name, review, and rating are required' });
-  if (rating < 1 || rating > 5)  return res.status(400).json({ error: 'Rating must be between 1 and 5' });
+  const r = parseInt(rating);
+  if (r < 1 || r > 5) return res.status(400).json({ error: 'Rating must be between 1 and 5' });
 
-  const db = readDB();
-  db.reviews.push({ id: uuidv4(), name, role: role || '', text, rating: parseInt(rating), approved: true, created_at: new Date().toISOString() });
-  writeDB(db);
-  logActivity('REVIEW_SUBMITTED', `Review by ${name} — ${rating} stars`, req);
+  await pool.query(
+    `INSERT INTO reviews (name, role, text, rating) VALUES ($1, $2, $3, $4)`,
+    [name, role || null, text, r]
+  );
+  await logActivity('REVIEW_SUBMITTED', req, null, { name, rating: r });
+
   res.json({ success: true, message: 'Review published!' });
-});
+}));
 
-// Public stats
-app.get('/api/stats', (req, res) => {
-  const db      = readDB();
-  const reviews = db.reviews.filter(r => r.approved);
-  const avg     = reviews.length ? (reviews.reduce((s, r) => s + r.rating, 0) / reviews.length).toFixed(1) : null;
+// ── Public stats ──────────────────────────────────────────────────
+app.get('/api/stats', asyncRoute(async (req, res) => {
+  const { rows: [reviewStats] } = await pool.query(
+    `SELECT COUNT(*)::int AS count, COALESCE(AVG(rating), 0)::numeric(3,1) AS avg
+     FROM reviews WHERE approved = true`
+  );
+  const { rows: [userStats] } = await pool.query(`SELECT COUNT(*)::int AS count FROM users`);
+
   res.json({
-    projects: 200 + reviews.length,
-    clients : 50  + Math.floor(db.users.length / 2),
-    reviews : reviews.length,
-    rating  : avg
+    projects: 200 + reviewStats.count,
+    clients : 50 + Math.floor(userStats.count / 2),
+    reviews : reviewStats.count,
+    rating  : reviewStats.count ? reviewStats.avg : null
   });
-});
+}));
 
 // ─────────────────────────────────────────────────────────────────
-// ADMIN ROUTES  (all protected by adminOnly, not just authMiddleware)
+// ADMIN ROUTES
 // ─────────────────────────────────────────────────────────────────
 
-app.post('/api/admin/login', adminLoginLimiter, async (req, res) => {
+app.post('/api/admin/login', adminLoginLimiter, asyncRoute(async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
@@ -397,19 +321,18 @@ app.post('/api/admin/login', adminLoginLimiter, async (req, res) => {
   const validPass  = await bcrypt.compare(password, ADMIN_PASS_HASH);
 
   if (!validEmail || !validPass) {
-    logActivity('ADMIN_LOGIN_FAILED', `Failed admin login attempt for ${email}`, req);
+    await logActivity('ADMIN_LOGIN_FAILED', req, null, { email });
     return res.status(401).json({ error: 'Invalid admin credentials' });
   }
 
   const token = jwt.sign({ admin: true, email }, JWT_SECRET, { expiresIn: '24h' });
-  logActivity('ADMIN_LOGIN', 'Admin logged in', req, { email, role: 'admin' });
+  await logActivity('ADMIN_LOGIN', req, null, { email });
   res.json({ success: true, token });
-});
+}));
 
-// Live activity stream — the admin dashboard's real-time notification feed.
-// EventSource can't send an Authorization header, so the admin JWT is passed
-// as a query param instead and verified by hand (same JWT_SECRET, same checks
-// as adminOnly, just adapted for SSE's transport limits).
+// Live activity stream (SSE). EventSource can't send headers, so the
+// admin token travels as a short-lived query param instead — verified
+// exactly like adminOnly, just adapted for SSE's transport limits.
 app.get('/api/admin/activity-stream', (req, res) => {
   const token = req.query.token;
   if (!token) return res.status(401).end();
@@ -423,19 +346,18 @@ app.get('/api/admin/activity-stream', (req, res) => {
   if (!payload.admin) return res.status(403).end();
 
   res.writeHead(200, {
-    'Content-Type'   : 'text/event-stream',
-    'Cache-Control'  : 'no-cache',
-    'Connection'     : 'keep-alive',
-    'X-Accel-Buffering': 'no' // disable proxy buffering (nginx/Render)
+    'Content-Type'     : 'text/event-stream',
+    'Cache-Control'    : 'no-cache',
+    'Connection'       : 'keep-alive',
+    'X-Accel-Buffering': 'no'
   });
   res.write(': connected\n\n');
 
-  const client = { id: uuidv4(), res };
+  const client = { id: payload.email + Date.now(), res };
   sseClients.push(client);
 
-  // Keep the connection alive through idle-timeout proxies
   const heartbeat = setInterval(() => {
-    try { res.write(': heartbeat\n\n'); } catch { /* handled by close event below */ }
+    try { res.write(': heartbeat\n\n'); } catch { /* handled on close */ }
   }, 25000);
 
   req.on('close', () => {
@@ -444,105 +366,150 @@ app.get('/api/admin/activity-stream', (req, res) => {
   });
 });
 
-app.get('/api/admin/dashboard', adminOnly, (req, res) => {
-  const db       = readDB();
-  const today    = new Date().toDateString();
-  const todayAct = db.activity.filter(a => new Date(a.created_at).toDateString() === today).length;
-  const reviews  = db.reviews.filter(r => r.approved);
-  const avg      = reviews.length ? (reviews.reduce((s, r) => s + r.rating, 0) / reviews.length).toFixed(1) : 0;
+// ── Dashboard summary ────────────────────────────────────────────
+app.get('/api/admin/dashboard', adminOnly, asyncRoute(async (req, res) => {
+  const [contacts, newContacts, users, reviews, pendingRevs, avgRating, todayLogs, recentLogs] = await Promise.all([
+    pool.query(`SELECT COUNT(*)::int AS n FROM contact_submissions`),
+    pool.query(`SELECT COUNT(*)::int AS n FROM contact_submissions WHERE status = 'new'`),
+    pool.query(`SELECT COUNT(*)::int AS n FROM users`),
+    pool.query(`SELECT COUNT(*)::int AS n FROM reviews`),
+    pool.query(`SELECT COUNT(*)::int AS n FROM reviews WHERE approved = false`),
+    pool.query(`SELECT COALESCE(AVG(rating), 0)::numeric(3,1) AS avg FROM reviews WHERE approved = true`),
+    pool.query(`SELECT COUNT(*)::int AS n FROM activity_logs WHERE created_at::date = CURRENT_DATE`),
+    pool.query(`
+      SELECT a.id, a.event_type, a.ip_address, a.created_at, u.name AS user_name
+      FROM activity_logs a LEFT JOIN users u ON u.id = a.user_id
+      ORDER BY a.created_at DESC LIMIT 10
+    `)
+  ]);
+
   res.json({
-    contacts   : db.contacts.length,
-    newContacts: db.contacts.filter(c => c.status === 'new').length,
-    users      : db.users.length,
-    reviews    : db.reviews.length,
-    pendingRevs: db.reviews.filter(r => !r.approved).length,
-    avgRating  : avg,
-    todayLogs  : todayAct,
-    recentLogs : db.activity.slice().reverse().slice(0, 10)
+    contacts   : contacts.rows[0].n,
+    newContacts: newContacts.rows[0].n,
+    users      : users.rows[0].n,
+    reviews    : reviews.rows[0].n,
+    pendingRevs: pendingRevs.rows[0].n,
+    avgRating  : avgRating.rows[0].avg,
+    todayLogs  : todayLogs.rows[0].n,
+    recentLogs : recentLogs.rows
   });
-});
+}));
 
-app.get('/api/admin/contacts', adminOnly, (req, res) => {
-  const db = readDB();
-  res.json(db.contacts.slice().reverse());
-});
+// ── Contacts ──────────────────────────────────────────────────────
+app.get('/api/admin/contacts', adminOnly, asyncRoute(async (req, res) => {
+  const { rows } = await pool.query(`SELECT * FROM contact_submissions ORDER BY created_at DESC`);
+  res.json(rows);
+}));
 
-app.patch('/api/admin/contacts/:id', adminOnly, (req, res) => {
+app.patch('/api/admin/contacts/:id', adminOnly, asyncRoute(async (req, res) => {
   const { status } = req.body;
-  const db = readDB();
-  db.contacts = db.contacts.map(c => c.id === req.params.id ? { ...c, status } : c);
-  writeDB(db);
-  logActivity('CONTACT_STATUS', `Contact ${req.params.id} marked as ${status}`, req, req.user);
+  await pool.query(`UPDATE contact_submissions SET status = $1 WHERE id = $2`, [status, req.params.id]);
+  await logActivity('CONTACT_STATUS_CHANGED', req, null, { contact_id: req.params.id, status, by_admin: req.user.email });
   res.json({ success: true });
-});
+}));
 
-app.delete('/api/admin/contacts/:id', adminOnly, (req, res) => {
-  const db = readDB();
-  db.contacts = db.contacts.filter(c => c.id !== req.params.id);
-  writeDB(db);
-  logActivity('CONTACT_DELETED', `Contact ${req.params.id} deleted`, req, req.user);
+app.delete('/api/admin/contacts/:id', adminOnly, asyncRoute(async (req, res) => {
+  await pool.query(`DELETE FROM contact_submissions WHERE id = $1`, [req.params.id]);
+  await logActivity('CONTACT_DELETED', req, null, { contact_id: req.params.id, by_admin: req.user.email });
   res.json({ success: true });
-});
+}));
 
-app.get('/api/admin/users', adminOnly, (req, res) => {
-  const db = readDB();
-  res.json(db.users.slice().reverse());
-});
+// ── Projects ("Start a Project" submissions) ─────────────────────
+app.get('/api/admin/projects', adminOnly, asyncRoute(async (req, res) => {
+  const { rows } = await pool.query(`SELECT * FROM projects ORDER BY created_at DESC`);
+  res.json(rows);
+}));
 
-app.delete('/api/admin/users/:id', adminOnly, (req, res) => {
-  const db = readDB();
-  db.users = db.users.filter(u => u.id !== req.params.id);
-  writeDB(db);
-  logActivity('USER_DELETED', `User ${req.params.id} deleted`, req, req.user);
+app.patch('/api/admin/projects/:id', adminOnly, asyncRoute(async (req, res) => {
+  const { status } = req.body;
+  await pool.query(`UPDATE projects SET status = $1 WHERE id = $2`, [status, req.params.id]);
+  await logActivity('PROJECT_STATUS_CHANGED', req, null, { project_id: req.params.id, status, by_admin: req.user.email });
   res.json({ success: true });
-});
+}));
 
-app.get('/api/admin/reviews', adminOnly, (req, res) => {
-  const db = readDB();
-  res.json(db.reviews.slice().reverse());
-});
+// ── Users ─────────────────────────────────────────────────────────
+app.get('/api/admin/users', adminOnly, asyncRoute(async (req, res) => {
+  const { rows } = await pool.query(`SELECT * FROM users ORDER BY created_at DESC`);
+  res.json(rows);
+}));
 
-app.patch('/api/admin/reviews/:id', adminOnly, (req, res) => {
+app.delete('/api/admin/users/:id', adminOnly, asyncRoute(async (req, res) => {
+  await pool.query(`DELETE FROM users WHERE id = $1`, [req.params.id]);
+  await logActivity('USER_DELETED', req, null, { user_id: req.params.id, by_admin: req.user.email });
+  res.json({ success: true });
+}));
+
+// Full activity history for one specific user — "everything this person did"
+app.get('/api/admin/users/:id/activity', adminOnly, asyncRoute(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT * FROM activity_logs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 200`,
+    [req.params.id]
+  );
+  res.json(rows);
+}));
+
+// ── Reviews (moderation) ──────────────────────────────────────────
+app.get('/api/admin/reviews', adminOnly, asyncRoute(async (req, res) => {
+  const { rows } = await pool.query(`SELECT * FROM reviews ORDER BY created_at DESC`);
+  res.json(rows);
+}));
+
+app.patch('/api/admin/reviews/:id', adminOnly, asyncRoute(async (req, res) => {
   const { approved } = req.body;
-  const db = readDB();
-  db.reviews = db.reviews.map(r => r.id === req.params.id ? { ...r, approved: !!approved } : r);
-  writeDB(db);
-  logActivity('REVIEW_MODERATED', `Review ${req.params.id} ${approved ? 'approved' : 'rejected'}`, req, req.user);
+  await pool.query(`UPDATE reviews SET approved = $1 WHERE id = $2`, [!!approved, req.params.id]);
+  await logActivity('REVIEW_MODERATED', req, null, { review_id: req.params.id, approved: !!approved, by_admin: req.user.email });
   res.json({ success: true });
-});
+}));
 
-app.delete('/api/admin/reviews/:id', adminOnly, (req, res) => {
-  const db = readDB();
-  db.reviews = db.reviews.filter(r => r.id !== req.params.id);
-  writeDB(db);
-  logActivity('REVIEW_DELETED', `Review ${req.params.id} deleted`, req, req.user);
+app.delete('/api/admin/reviews/:id', adminOnly, asyncRoute(async (req, res) => {
+  await pool.query(`DELETE FROM reviews WHERE id = $1`, [req.params.id]);
+  await logActivity('REVIEW_DELETED', req, null, { review_id: req.params.id, by_admin: req.user.email });
   res.json({ success: true });
-});
+}));
 
-// Activity log (paginated) — filterable by type
-app.get('/api/admin/activity', adminOnly, (req, res) => {
-  const db    = readDB();
-  const page  = parseInt(req.query.page  || 1);
-  const limit = parseInt(req.query.limit || 50);
-  const type  = req.query.type;
-  let all     = db.activity.slice().reverse();
-  if (type) all = all.filter(a => a.type === type);
-  const total = all.length;
-  const logs  = all.slice((page - 1) * limit, page * limit);
-  res.json({ logs, total, page, pages: Math.ceil(total / limit) });
-});
+// ── Site-wide activity log (paginated, filterable) ────────────────
+app.get('/api/admin/activity', adminOnly, asyncRoute(async (req, res) => {
+  const page  = Math.max(parseInt(req.query.page) || 1, 1);
+  const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+  const { type, user_id: userId } = req.query;
 
-// ── Global error handler (avoid leaking stack traces) ───────────
+  const conditions = [];
+  const params = [];
+  if (type)   { params.push(type);   conditions.push(`a.event_type = $${params.length}`); }
+  if (userId) { params.push(userId); conditions.push(`a.user_id = $${params.length}`); }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+  const { rows: [{ count }] } = await pool.query(
+    `SELECT COUNT(*)::int AS count FROM activity_logs a ${where}`, params
+  );
+
+  params.push(limit, (page - 1) * limit);
+  const { rows: logs } = await pool.query(
+    `SELECT a.id, a.event_type, a.ip_address, a.user_agent, a.metadata, a.created_at,
+            u.id AS user_id, u.name AS user_name, u.email AS user_email, u.phone AS user_phone
+     FROM activity_logs a
+     LEFT JOIN users u ON u.id = a.user_id
+     ${where}
+     ORDER BY a.created_at DESC
+     LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params
+  );
+
+  res.json({ logs, total: count, page, pages: Math.ceil(count / limit) });
+}));
+
+// ── Global error handler ───────────────────────────────────────
 app.use((err, req, res, next) => {
   console.error(err);
   res.status(500).json({ error: 'Something went wrong.' });
 });
 
-// ── Start ───────────────────────────────────────────────────────
+// ── Housekeeping: purge old OTPs once a day ─────────────────────
+setInterval(() => {
+  purgeExpiredOtps().catch(e => console.error('OTP purge failed:', e.message));
+}, 24 * 60 * 60 * 1000);
+
+// ── Start ─────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`✅ Creative Minds server running on port ${PORT}`);
-  if (!fs.existsSync(DB_FILE)) {
-    writeDB(initDB());
-    console.log('✅ Database initialized');
-  }
+  console.log(`✅ Creative Minds server running on port ${PORT} (${NODE_ENV})`);
 });
