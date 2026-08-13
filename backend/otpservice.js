@@ -6,8 +6,9 @@
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const twilio = require('twilio');
-const pool = require('./Db');
-const { sendMail } = require('./Mailer');
+// otpservice.js
+const pool = require('./db');
+const { sendMail } = require('./mailer');
 
 const TWILIO_REQUIRED = ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN', 'TWILIO_PHONE_NUMBER'];
 const twilioMissing = TWILIO_REQUIRED.filter(k => !process.env[k]);
