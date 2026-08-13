@@ -8,9 +8,10 @@ const bcrypt         = require('bcryptjs');
 const helmet         = require('helmet');
 const rateLimit      = require('express-rate-limit');
 
-const pool = require('./Db');
-const { sendMail, escapeHtml, isConfigured: emailConfigured } = require('./Mailer');
-const { createAndSendOtp, verifyOtp, purgeExpiredOtps } = require('./Otpservice');
+// server.js
+const pool = require('./db');
+const { sendMail, escapeHtml, isConfigured: emailConfigured } = require('./mailer');
+const { createAndSendOtp, verifyOtp, purgeExpiredOtps } = require('./otpservice');
 
 const app  = express();
 const PORT = process.env.PORT || 4000;
