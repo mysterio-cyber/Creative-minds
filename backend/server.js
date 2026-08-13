@@ -8,7 +8,7 @@ const bcrypt         = require('bcryptjs');
 const helmet         = require('helmet');
 const rateLimit      = require('express-rate-limit');
 
-const pool = require('./db');
+const pool = require('./Db');
 const { sendMail, escapeHtml, isConfigured: emailConfigured } = require('./mailer');
 const { createAndSendOtp, verifyOtp, purgeExpiredOtps } = require('./otpService');
 
