@@ -53,7 +53,7 @@ app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().t
 // ── Rate limiters (separate budgets for send vs verify) ─────────
 const sendOtpLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 5,
+  max: 15,
   message: { error: 'Too many OTP requests. Please try again later.' }
 });
 const verifyOtpLimiter = rateLimit({
