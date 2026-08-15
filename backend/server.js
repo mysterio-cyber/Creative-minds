@@ -15,7 +15,7 @@ const rateLimit      = require('express-rate-limit');
 const pool = require('./db');
 const { sendMail, escapeHtml, isConfigured: emailConfigured } = require('./mailer');
 const { createAndSendOtp, verifyOtp, purgeExpiredOtps } = require('./otpservice');
-
+const googleAuthRoutes = require('./routes/googleAuth.routes');
 const app  = express();
 const PORT = process.env.PORT || 4000;
 
@@ -49,6 +49,7 @@ app.set('trust proxy', 1);
 app.use(helmet());
 app.use(cors({ origin: FRONTEND_URL }));
 app.use(express.json({ limit: '100kb' }));
+app.use('/api', googleAuthRoutes);
 
 app.get('/', (req, res) => res.send('Creative Minds backend is running 🚀'));
 app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
