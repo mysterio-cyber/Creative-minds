@@ -25,6 +25,13 @@ body{font-family:'Inter',sans-serif;background:var(--cream);color:var(--ink);ove
 .logo-mark.sz-footer{width:60px;height:60px;font-size:22px;}
 .logo-mark.sz-hero{width:320px;height:320px;font-size:96px;}
 
+/* ACTUAL CREATIVE MINDS LOGO IMAGE */
+.logo-img{display:block;object-fit:contain;flex-shrink:0;}
+.logo-img.sz-nav{width:48px;height:48px;border-radius:50%;}
+.logo-img.sz-modal{width:42px;height:42px;border-radius:50%;}
+.logo-img.sz-footer{width:60px;height:60px;border-radius:50%;}
+.logo-img.sz-hero{width:320px;height:320px;border-radius:50%;object-fit:contain;}
+
 /* NAV */
 nav{position:sticky;top:0;z-index:200;background:rgba(250,247,240,0.97);backdrop-filter:blur(16px);border-bottom:1px solid var(--border);padding:0 5%;display:flex;align-items:center;justify-content:space-between;height:72px;}
 .nav-logo{display:flex;align-items:center;gap:12px;text-decoration:none;}
@@ -383,7 +390,7 @@ footer{background:var(--ink);color:white;padding:64px 5% 28px;}
 <!-- NAV -->
 <nav>
   <a href="#" class="nav-logo">
-    <div class="logo-mark sz-nav">CM</div>
+    <img src="Creative Minds logo.jpg" class="logo-img sz-nav" alt="Creative Minds Logo">
     <div>
       <div class="nav-logo-name">Creative Minds</div>
       <span class="nav-logo-tag">Ideate &middot; Innovate &middot; Inspire</span>
@@ -443,7 +450,7 @@ footer{background:var(--ink);color:white;padding:64px 5% 28px;}
     </div>
     <div class="hero-logo-wrap">
       <div class="hero-logo-ring">
-        <div class="logo-mark sz-hero">CM</div>
+        <img src="Creative Minds logo.jpg" class="logo-img sz-hero" alt="Creative Minds Logo">
       </div>
       <div class="float-tag ft1"><div class="ft-dot"></div>Design + Build + Scale</div>
       <div class="float-tag ft2"><div class="ft-dot"></div>Trusted by 50+ Clients</div>
@@ -641,7 +648,7 @@ footer{background:var(--ink);color:white;padding:64px 5% 28px;}
   <div class="footer-inner">
     <div class="footer-top">
       <div class="footer-brand">
-        <div class="logo-mark sz-footer">CM</div>
+        <img src="Creative Minds logo.jpg" class="logo-img sz-footer" alt="Creative Minds Logo">
         <div class="footer-brand-name">Creative Minds</div>
         <div class="footer-tagline">Ideate &middot; Innovate &middot; Inspire</div>
         <p>Where creative thinking meets technical excellence. Building the digital future of bold businesses.</p>
@@ -670,7 +677,7 @@ footer{background:var(--ink);color:white;padding:64px 5% 28px;}
 <div class="modal-overlay" id="authModal">
   <div class="modal-box">
     <button type="button" class="modal-close" onclick="closeModal()">&#10005;</button>
-    <div class="modal-logo"><div class="logo-mark sz-modal">CM</div><div class="modal-logo-name">Creative Minds</div></div>
+    <div class="modal-logo"><img src="Creative Minds logo.jpg" class="logo-img sz-modal" alt="Creative Minds Logo"><div class="modal-logo-name">Creative Minds</div></div>
     <div class="api-error" id="authError"></div>
 
     <div class="step active" id="step1">
@@ -751,7 +758,7 @@ footer{background:var(--ink);color:white;padding:64px 5% 28px;}
 <div class="modal-overlay" id="bookingModal">
   <div class="modal-box wide">
     <button type="button" class="modal-close" onclick="closeBooking()">&#10005;</button>
-    <div class="modal-logo"><div class="logo-mark sz-modal">CM</div><div class="modal-logo-name">Start a Project</div></div>
+    <div class="modal-logo"><img src="Creative Minds logo.jpg" class="logo-img sz-modal" alt="Creative Minds Logo"><div class="modal-logo-name">Start a Project</div></div>
     <div class="booking-steps"><div class="bstep active" id="bs1"></div><div class="bstep" id="bs2"></div><div class="bstep" id="bs3"></div></div>
 
     <div class="step active" id="bstep1">
@@ -826,7 +833,7 @@ footer{background:var(--ink);color:white;padding:64px 5% 28px;}
 <div class="modal-overlay" id="giftModal">
   <div class="modal-box">
     <button type="button" class="modal-close" onclick="closeGift()">&#10005;</button>
-    <div class="modal-logo"><div class="logo-mark sz-modal">CM</div><div class="modal-logo-name">Gift a Package</div></div>
+    <div class="modal-logo"><img src="Creative Minds logo.jpg" class="logo-img sz-modal" alt="Creative Minds Logo"><div class="modal-logo-name">Gift a Package</div></div>
 
     <div class="step active" id="gstep1">
       <div class="modal-title">Gift Creative Minds</div>
